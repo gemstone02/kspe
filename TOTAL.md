@@ -1,4 +1,4 @@
-# SEUNGPYO — ROS2 Dual-Arm Vision Cell
+# ROS2 Dual-Arm Vision Cell
 
 ROS2 Humble 기반의 비전 인식 및 듀얼 로봇팔 자동화 공정 패키지입니다.
 
