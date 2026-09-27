@@ -31,6 +31,10 @@ setup(
             os.path.join('share', package_name, 'pt'),
             glob('pt/*.pt')
         ),
+        (
+            os.path.join('share', package_name, 'launch'),
+            glob('launch/*.launch.py')
+        ),
     ],
 
     install_requires=['setuptools'],
@@ -49,7 +53,7 @@ setup(
     entry_points={
         'console_scripts': [
             'B_arm_v2_tolerance = vision_pkg.B_arm_v2_tolerance:main',
-            'baseplate_top_bbox_wonseok = vision_pkg.baseplate_top_bbox_wonseok:main',
+            'base_top = vision_pkg.base_top:main',
             'centric_gripper_5axis = vision_pkg.centric_gripper_5axis:main',
             'dxl_bridge_suction_5axis = vision_pkg.dxl_bridge_suction_5axis:main',
             'experiment = vision_pkg.experiment:main',
@@ -72,6 +76,11 @@ setup(
             'base_process = vision_pkg.base_process:main',
             'Baseplate_side = vision_pkg.Baseplate_side:main',
             'jabara = vision_pkg.jabara:main',
+            'top = vision_pkg.top:main',
+            'side = vision_pkg.side:main',
+            'cell = vision_pkg.cell:main',
+            'cell_cli = vision_pkg.cell_cli:main',
+            'holes = vision_pkg.holes:main',
         ],
     },
 )
