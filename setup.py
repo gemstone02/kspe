@@ -80,6 +80,7 @@ setup(
             'side = vision_pkg.side:main',
             'cell = vision_pkg.cell:main',
             'cell_cli = vision_pkg.cell_cli:main',
+            'assembly_debug = vision_pkg.assembly_debug:main',
             'holes = vision_pkg.holes:main',
         ],
     },

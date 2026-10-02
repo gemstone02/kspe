@@ -84,16 +84,19 @@ class Cell(_BaseplateCentricSequenceNode):
         self.declare_parameter('b_dxl_port', '/dev/ttyUSB1')
         self.declare_parameter('b_dxl_baud', 2000000)
         self.declare_parameter('b_move_timeout_sec', 25.0)
+        self.declare_parameter('assembly_debug_mode', False)
+        self.assembly_debug_mode = bool(g('assembly_debug_mode').value)
         try:
             if self.use_robot:
-                if not bool(g('use_b_robot').value):
+                if not self.assembly_debug_mode and not bool(g('use_b_robot').value):
                     raise RuntimeError('실물 전체 공정에는 use_b_robot:=true가 필요합니다')
                 a_port = str(g('dxl_port').value)
                 b_port = str(g('b_dxl_port').value)
-                if os.path.realpath(a_port) == os.path.realpath(b_port):
+                if not self.assembly_debug_mode and os.path.realpath(a_port) == os.path.realpath(b_port):
                     raise RuntimeError('A/B 로봇은 서로 다른 U2D2 포트가 필요합니다')
                 a_ok = self._probe_arm('A팔', a_port, int(g('dxl_baud').value), range(1, 8))
-                b_ok = self._probe_arm('B팔', b_port, int(g('b_dxl_baud').value), range(9, 17))
+                b_ok = (True if self.assembly_debug_mode else
+                        self._probe_arm('B팔', b_port, int(g('b_dxl_baud').value), range(9, 17)))
                 if not (a_ok and b_ok):
                     raise RuntimeError('A/B 로봇 연결 확인 실패: 위 로그의 팔/모터 ID를 확인하세요')
         except Exception:
@@ -141,13 +144,16 @@ class Cell(_BaseplateCentricSequenceNode):
         super().__init__()
         for key, value in (
             ('simulate_inspection', False), ('side_timeout_sec', 8.0),
-            ('top_z_mm', 30.0), ('base_z_mm', 15.0),
+            ('top_z_mm', 30.0), ('base_z_mm', 30.0),
             ('suction_dwell_sec', 0.5),
             ('assembly_holes_timeout_sec', 180.0),
             ('good_rail_mm', 350.0), ('reject_rail_mm', 550.0),
             ('sort_pose_deg', [180.0, -25.0, -35.0, -50.0, 0.0]),
             ('reject_sort_pose_deg', [180.0, -25.0, -35.0, -50.0, 0.0]),
             ('base_release_pose_deg', [0.0, 0.0, 0.0, 0.0, 0.0]),
+            ('base_assembly_x_mm', 210.0),
+            ('base_assembly_y_mm', 140.0),
+            ('assembly_release_open_deg', 20.0),
             ('lid_rail_mm', 680.0),
             ('lid_pick_pose_deg', '0 -45 -65 -65 0'),
             ('lid_approach_z_mm', 80.0), ('lid_probe_start_z_mm', 50.0),
@@ -162,8 +168,8 @@ class Cell(_BaseplateCentricSequenceNode):
             raise RuntimeError('real suction requires Arduino rail/suction controller')
         self.b_arm = None
         self.b_ready = not self.use_robot
-        self.use_b_robot = bool(g('use_b_robot'))
-        if self.use_robot and not self.use_b_robot:
+        self.use_b_robot = bool(g('use_b_robot')) and not self.assembly_debug_mode
+        if self.use_robot and not self.use_b_robot and not self.assembly_debug_mode:
             raise RuntimeError('real two-arm process requires use_b_robot:=true')
         if self.use_b_robot:
             if not self.use_robot:
@@ -196,6 +202,15 @@ class Cell(_BaseplateCentricSequenceNode):
         self.suction_dwell = max(0.0, float(g('suction_dwell_sec')))
         self.good_rail = float(g('good_rail_mm'))
         self.reject_rail = float(g('reject_rail_mm'))
+        self.base_assembly_point = np.array(
+            [float(g('base_assembly_x_mm')), float(g('base_assembly_y_mm'))],
+            dtype=float)
+        if not np.isfinite(self.base_assembly_point).all() or \
+                not self._in_a3(self.base_assembly_point):
+            raise ValueError('base assembly XY must be inside calibrated A3')
+        self.assembly_release_open_deg = float(g('assembly_release_open_deg'))
+        if not 0.0 < self.assembly_release_open_deg <= 180.0:
+            raise ValueError('assembly_release_open_deg must be in (0, 180]')
         self.sort_pose = [float(x) for x in g('sort_pose_deg')]
         self.reject_sort_pose = [float(x) for x in g('reject_sort_pose_deg')]
         self.lid_rail = float(g('lid_rail_mm'))
@@ -214,6 +229,8 @@ class Cell(_BaseplateCentricSequenceNode):
                 self.bearing_preclose_angle_deg,
                 self.gear_preclose_angle_deg):
             raise ValueError('centric travel limit must cover all preclose angles')
+        if self.assembly_release_open_deg > grip_limit:
+            raise ValueError('assembly release opening exceeds centric travel limit')
         self.centric_full_close_angle_deg = grip_limit
         self.preclose_ratio = self.centric_preclose_angle_deg / grip_limit
         self.inspection_j5_tolerance_deg = float(g('inspection_j5_tolerance_deg'))
@@ -236,6 +253,9 @@ class Cell(_BaseplateCentricSequenceNode):
                 self.lid_probe_poll > 0 and self.lid_probe_hold >= 0):
             raise ValueError('invalid lid approach/probe parameters')
         self.target = None
+        self._assembly_cycle_active = False
+        self._grasp_hold_position = None
+        self._grasp_hold_ratio = None
         self.tool = 'suction'
         self._last_b_pose = None
         self._resume_event = threading.Event()
@@ -665,6 +685,27 @@ class Cell(_BaseplateCentricSequenceNode):
                 time.sleep(min(.05, deadline - time.monotonic()))
 
     def _move_gripper_ratio(self, ratio):
+        if self._assembly_cycle_active and self.phase.endswith('_RELEASE'):
+            if self.gripper is not None:
+                if self._grasp_hold_position is None:
+                    raise RuntimeError('assembly release has no recorded grasp position')
+                travel = int(round(
+                    self.gripper.max_move_pulse * self.assembly_release_open_deg
+                    / self.centric_full_close_angle_deg))
+                target = self.gripper.clamp_position(
+                    self._grasp_hold_position - self.gripper.close_direction * travel)
+                ratio = ((target - self.gripper.open_position)
+                         * self.gripper.close_direction / self.gripper.safe_move_pulse)
+                self.get_logger().info(
+                    'Assembly release: grasp=%d, open target=%d (%.1f planet deg)'
+                    % (self._grasp_hold_position, target,
+                       self.assembly_release_open_deg))
+            else:
+                if self._grasp_hold_ratio is None:
+                    raise RuntimeError('assembly release has no simulated grasp position')
+                ratio = max(0.0, self._grasp_hold_ratio -
+                            self.assembly_release_open_deg /
+                            self.centric_full_close_angle_deg)
         if self.gripper is None:
             return super()._move_gripper_ratio(ratio)
         self._check_stop()
@@ -679,8 +720,15 @@ class Cell(_BaseplateCentricSequenceNode):
         return bool(result)
 
     def _finish_grasp(self):
+        self._grasp_hold_position = None
+        self._grasp_hold_ratio = None
         if self.full_grasp_mode == 'fixed_100' or self.gripper is None:
-            return super()._finish_grasp()
+            result = super()._finish_grasp()
+            if self.gripper is not None:
+                self._grasp_hold_position = self.gripper.read_position()
+            else:
+                self._grasp_hold_ratio = float(self.sim_gripper_ratio)
+            return result
         self._check_stop()
         self._set_sim_state(gripper='AUTO GRASPING')
         result = self.gripper.auto_grasp(
@@ -689,7 +737,19 @@ class Cell(_BaseplateCentricSequenceNode):
         self._check_stop()
         if not result.success:
             raise RuntimeError('centric grasp failed: ' + result.reason)
+        self._grasp_hold_position = int(result.position)
         self._set_sim_state(gripper='HOLDING')
+
+    def _pick_and_place_cycle(self, *args, **kwargs):
+        self._assembly_cycle_active = True
+        self._grasp_hold_position = None
+        self._grasp_hold_ratio = None
+        try:
+            return super()._pick_and_place_cycle(*args, **kwargs)
+        finally:
+            self._assembly_cycle_active = False
+            self._grasp_hold_position = None
+            self._grasp_hold_ratio = None
 
     def _vertical_at(self, point, z_mm, action):
         approach, descent, ascent, _ = self._build_vertical_paths(
@@ -884,6 +944,10 @@ class Cell(_BaseplateCentricSequenceNode):
                 logger=self.get_logger(),
                 planet_max_angle_deg=float(
                     self.get_parameter('centric_planet_max_angle_deg').value),
+                # Opening and the final automatic closing use the same
+                # Dynamixel profile velocity in this cell.
+                normal_profile_velocity=44,
+                auto_profile_velocity=44,
                 auto_load_threshold_percent=float(
                     self.get_parameter('centric_auto_load_threshold_percent').value),
                 auto_load_count_limit=int(
@@ -1062,7 +1126,10 @@ class Cell(_BaseplateCentricSequenceNode):
             q = np.degrees(self._current_q_rad()).tolist()
             q[0] = 0.0
             self._move_arm(q)
-            assembly_point = self._current_a3_point()
+            assembly_point = self.base_assembly_point.copy()
+            self.get_logger().info(
+                'Baseplate assembly placement A3=(%.1f, %.1f) mm'
+                % tuple(assembly_point))
             self._vertical_at(assembly_point, self.base_z,
                               lambda: self._suction(False))
             self._holes_needed_after = time.monotonic()
