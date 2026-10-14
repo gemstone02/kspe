@@ -22,7 +22,8 @@ from .B_arm_v2_tolerance import DxlConfig, DynamixelArmB, RobotCalibration
 from .centric_gripper_5axis import CentricGripper
 from .centric_sequence_5axis import (
     A3_LT_ROBOT_X_MM, A3_LT_ROBOT_Y_MM, DxlBridge,
-    N_JOINTS, _BaseplateCentricSequenceNode, fk_pos, plan_joint_path,
+    JOINT_MOTORS, PROFILE_VELOCITY,
+    N_JOINTS, SequenceStopped, _BaseplateCentricSequenceNode, fk_pos, plan_joint_path,
 )
 from .cell_rail_serial import RAIL_MAX_M, RailSerial
 
@@ -80,6 +81,8 @@ class Cell(_BaseplateCentricSequenceNode):
     def _setup_hardware(self, g):
         # The parent creates the PyBullet viewer in another OS process first.
         # Both suction and rail use the SAME Arduino serial owner here.
+        self.declare_parameter('baseplate_test_mode', False)
+        self.baseplate_test_mode = bool(g('baseplate_test_mode').value)
         self.declare_parameter('use_b_robot', False)
         self.declare_parameter('b_dxl_port', '/dev/ttyUSB1')
         self.declare_parameter('b_dxl_baud', 2000000)
@@ -144,6 +147,7 @@ class Cell(_BaseplateCentricSequenceNode):
         super().__init__()
         for key, value in (
             ('simulate_inspection', False), ('side_timeout_sec', 8.0),
+            ('top_camera_enabled', True), ('arm_camera_enabled', True),
             ('top_z_mm', 30.0), ('base_z_mm', 30.0),
             ('suction_dwell_sec', 0.5),
             ('assembly_holes_timeout_sec', 180.0),
@@ -196,6 +200,8 @@ class Cell(_BaseplateCentricSequenceNode):
                 self._stop_simulation_process()
                 raise
         self.simulate_inspection = bool(g('simulate_inspection'))
+        self.top_camera_enabled = bool(g('top_camera_enabled'))
+        self.arm_camera_enabled = bool(g('arm_camera_enabled'))
         self.side_timeout = float(g('side_timeout_sec'))
         self.top_z = float(g('top_z_mm'))
         self.base_z = float(g('base_z_mm'))
@@ -253,6 +259,11 @@ class Cell(_BaseplateCentricSequenceNode):
                 self.lid_probe_poll > 0 and self.lid_probe_hold >= 0):
             raise ValueError('invalid lid approach/probe parameters')
         self.target = None
+        self._test_top = None
+        self._test_holding = False
+        self._test_result = None
+        self._test_records = []
+        self._test_last_view = None
         self._assembly_cycle_active = False
         self._grasp_hold_position = None
         self._grasp_hold_ratio = None
@@ -278,9 +289,18 @@ class Cell(_BaseplateCentricSequenceNode):
         self.ready_pub = self.create_publisher(String, '/cell/ready', 10)
         self.side_pub = self.create_publisher(String, '/cell/side_command', 10)
         self.hole_pub = self.create_publisher(String, '/cell/hole_scan', 10)
+        self.test_result_pub = self.create_publisher(String, '/cell/baseplate_test_result', 10)
         self.create_subscription(String, '/cell/top_result', self._on_top, 10)
         self.create_subscription(String, '/cell/side_result', self._on_side, 10)
         self.get_logger().info('A/B current poses captured as zero; commands: resume, stop')
+        if self.baseplate_test_mode:
+            self.auto_start_on_vision = False
+            self.get_logger().info('Test cameras: TOP=%s, B=%s' %
+                                   (self.top_camera_enabled, self.arm_camera_enabled))
+            self.get_logger().info('1자 시작 자세를 영점으로 저장했습니다. '
+                                   'aj/bj/bottom/back/flash 명령을 바로 사용할 수 있습니다. '
+                                   'mechhome은 기계적 끝점에서 실측 틱 이동량으로 복귀할 때 사용합니다.')
+            self._test_help()
 
     @staticmethod
     def _parse_lid_pose(raw):
@@ -295,6 +315,8 @@ class Cell(_BaseplateCentricSequenceNode):
         return values
 
     def _on_top(self, msg):
+        if self.baseplate_test_mode and not self.top_camera_enabled:
+            return
         try:
             d = json.loads(msg.data)
             kind = str(d['product']).lower()
@@ -312,6 +334,12 @@ class Cell(_BaseplateCentricSequenceNode):
                 self.get_logger().warning('Top result ignored: cell busy')
                 return
             self.target = dict(product=kind, judge=judge, point=point)
+            if self.baseplate_test_mode:
+                if kind == 'baseplate':
+                    self._test_top = dict(self.target)
+                    self.get_logger().info('Baseplate TOP=%s cached; enter baseplate to pick' % judge)
+                self.target = None
+                return
             self._start_sequence()
         except (ValueError, KeyError, TypeError) as exc:
             self.get_logger().error('Invalid top result: %s' % exc)
@@ -346,6 +374,8 @@ class Cell(_BaseplateCentricSequenceNode):
     def _handle_command(self, raw):
         command = str(raw).strip().lower()
         parts = command.split()
+        if self.baseplate_test_mode and self._handle_test_command(parts):
+            return
         if parts and parts[0] in ('aj', 'bj', 'r'):
             name = parts[0]
             if self.busy or self._pause_event.is_set() or self._tool_change_waiting:
@@ -416,6 +446,16 @@ class Cell(_BaseplateCentricSequenceNode):
         # Consume cell-specific commands before the inherited E-stop handler
         # discards the worker's call stack.
         self._poll_viewer_commands()
+        if getattr(self, 'baseplate_test_mode', False):
+            # Old assembly/viewer buttons cannot start inherited assembly cycles.
+            if self._button_clicked('stop'):
+                self._pause_cycle()
+            if self._button_clicked('resume_cycle'):
+                self._resume_cycle()
+            if self._button_clicked('abort_cycle'):
+                self._abort_cycle()
+            self._send_viewer_state()
+            return
         if self._button_clicked('stop'):
             self._pause_cycle()
         if self._button_clicked('resume_cycle'):
@@ -569,6 +609,9 @@ class Cell(_BaseplateCentricSequenceNode):
         self._start_auxiliary('B_RETURN_HOME', lambda: self._b_move([90, 0, 0, 0, 0, 0]))
 
     def _start_sequence(self):
+        if getattr(self, 'baseplate_test_mode', False):
+            self.get_logger().info('Test mode waits for baseplate or inspect command')
+            return
         if self.busy:
             self.get_logger().warning('Cell is busy; resume or finish the current process')
             return
@@ -822,6 +865,9 @@ class Cell(_BaseplateCentricSequenceNode):
         if self.simulate_inspection and not self.use_robot:
             time.sleep(.1)
             return 'OK'
+        if self.baseplate_test_mode and not self.arm_camera_enabled:
+            self.get_logger().info('%s: B camera disabled; observation skipped' % view)
+            return 'SKIPPED'
         request = uuid.uuid4().hex[:12]
         self._waiting_request = request
         self._last_result = None
@@ -879,27 +925,26 @@ class Cell(_BaseplateCentricSequenceNode):
 
     def _views_baseplate(self):
         """Baseplate-only BOTTOM once, BACK eight, FLASH eight."""
+        bottom_a, bottom_b = self._BASEPLATE_POSES['BOTTOM']
         self._set_phase('BOTTOM_VIEW')
-        self._dual_pose([0, 15, -25, -80, 0], [0, 0, 15, 0, -85, 180])
+        self._dual_pose(bottom_a, bottom_b)
         if self._inspect('BOTTOM_1') == 'NG':
             return False
-        for name, a_pose, b_pose in (
-            ('BACK', [0, 0, -85, 85, 0], [0, 0, 25, 0, -60, 180]),
-            ('FLASH', [0, 5, -60, -105, 0], [0, 0, 50, 0, -82, 180]),
-        ):
+        for name in ('BACK', 'FLASH'):
+            a_pose, b_pose = self._BASEPLATE_POSES[name]
             if name == 'BACK':
                 # From BOTTOM, B rotates only q1 to 75 deg while A moves
                 # directly to its BACK inspection pose.
                 self._set_phase('BOTTOM_TO_BACK_INTERMEDIATE')
-                self._dual_pose(a_pose, [75, 0, 15, 0, -85, 180])
+                self._dual_pose(a_pose, [75] + list(bottom_b[1:]))
             else:
                 # From BACK, B rotates only q1 to 75 deg while A moves
                 # directly to its FLASH inspection pose.
                 self._set_phase('BACK_TO_FLASH_INTERMEDIATE')
-                self._dual_pose(a_pose, [75, 0, 25, 0, -60, 180])
+                self._dual_pose(a_pose, [75] + list(self._BASEPLATE_POSES['BACK'][1][1:]))
             self._set_phase(name + '_VIEW')
             self._b_move(b_pose)
-            for index, q5 in enumerate((0, 45, 90, 135, 180, -45, -90, -135), 1):
+            for index, q5 in enumerate(self._BASEPLATE_YAWS, 1):
                 self._move_arm(a_pose[:4] + [q5])
                 if self._inspect('%s_%d' % (name, index)) == 'NG':
                     return False
@@ -1166,6 +1211,375 @@ class Cell(_BaseplateCentricSequenceNode):
             self._holes_needed_after = None
             if success:
                 self.ready_pub.publish(String(data='READY'))
+
+    # Shared baseplate poses; test commands are enabled by baseplate.launch.py.
+    _BASEPLATE_POSES = {
+        'BOTTOM': ([0, 10, 5, -100, 0], [0, 0, -37, 0, -50, 180]),
+        'BACK': ([0, 0, -85, 90, 0], [0, 0, -25, 0, -60, 180]),
+        'FLASH': ([0, -10, -50, -95, 0], [0, 0, -50, 0, -93, 180]),
+    }
+    _BASEPLATE_YAWS = (0, 45, 90, 135, 180, -45, -90, -135)
+    # Same measured stop-to-straight travel as assembly_debug._mechhome.
+    # Coupled motors use equal/opposite travel to avoid fighting each other.
+    _MECHANICAL_HOME_OFFSETS = {
+        2: 3473.5 - (-4279.0),
+        3: 1562.0 - 8414.5,
+        4: -(1562.0 - 8414.5),
+        5: 995.8 - (-3140.0),
+        6: -(995.8 - (-3140.0)),
+    }
+
+    def _measured_mechhome(self):
+        """Current stop ticks + measured travel = the new straight-pose zero."""
+        offsets = self._MECHANICAL_HOME_OFFSETS
+        reference = np.array([
+            0.0,
+            offsets[2] * 360.0 / (4096 * JOINT_MOTORS[1]['gear']),
+            offsets[3] * 360.0 / (4096 * JOINT_MOTORS[2]['gear']),
+            offsets[5] * 360.0 / (4096 * JOINT_MOTORS[3]['gear']),
+            0.0,
+        ])
+        self._check_stop()
+        if self.bridge is None:
+            self.reference_ready = True
+            self._set_sim_state(q_deg=reference.tolist())
+            self._move_arm([0.0] * 5)
+            return
+        # The operator supplies the physical stops, with J1/J5 at their marks.
+        self.reference_ready = False
+        present = {motor_id: self.bridge._present(motor_id)
+                   for joint in JOINT_MOTORS[:5] for motor_id in joint['ids']}
+        zero = {motor_id: tick + offsets.get(motor_id, 0.0)
+                for motor_id, tick in present.items()}
+        self.get_logger().warning('MECH HOME current stop ticks=%s; measured travel=%s; '
+                                  'straight goal ticks=%s' %
+                                  (present, offsets, {i: round(v) for i, v in zero.items()}))
+        self.bridge.zero_tick.update(zero)
+        actual = np.asarray(self.bridge.read_joints()[:5], dtype=float)
+        measured = np.degrees(actual)
+        if len(measured) != 5 or not np.isfinite(measured).all() or \
+                max(abs(measured - reference)) > 0.25:
+            raise RuntimeError('measured mechanical zero verification failed: %s' % measured)
+        self.reference_ready = True
+        self._set_sim_state(q_deg=reference.tolist())
+        speed_deg_s = 8.0
+        profile = {}
+        for joint in JOINT_MOTORS[:5]:
+            pv = max(1, int(round(speed_deg_s * joint['gear'] / (0.229 * 6.0))))
+            for motor_id in joint['ids']:
+                profile[motor_id] = min(PROFILE_VELOCITY[motor_id], pv)
+        try:
+            for motor_id, pv in profile.items():
+                self.bridge._w4(motor_id, 112, pv)
+            self._check_stop()
+            self.bridge.command_joints([0.0] * 5)
+            epoch = self._motion_epoch
+            deadline = self._process_time() + max(
+                self.joint_timeout, max(abs(reference)) / speed_deg_s + 30.0)
+            while self._process_time() < deadline:
+                self._check_stop()
+                if epoch != self._motion_epoch:
+                    self.bridge.command_joints([0.0] * 5)
+                    epoch = self._motion_epoch
+                actual = np.asarray(self.bridge.read_joints()[:5], dtype=float)
+                if len(actual) != 5 or not np.isfinite(actual).all():
+                    raise RuntimeError('invalid A-arm reading during measured mechhome')
+                self._set_sim_state(q_deg=np.degrees(actual).tolist())
+                if max(abs(np.degrees(np.arctan2(np.sin(actual), np.cos(actual))))) <= 1.5:
+                    paired_ok = True
+                    for joint in JOINT_MOTORS[2:4]:
+                        motor_id = joint['ids'][1]
+                        tolerance = 1.5 * joint['gear'] * 4096 / 360.0
+                        if abs(self.bridge._present(motor_id) - round(zero[motor_id])) > tolerance:
+                            paired_ok = False
+                    if paired_ok:
+                        self.get_logger().info('Measured MECH HOME complete; ID4/ID6 verified')
+                        return
+                time.sleep(.15)
+            raise RuntimeError('Measured MECH HOME arrival timeout')
+        finally:
+            for motor_id in profile:
+                try:
+                    self.bridge._w4(motor_id, 112, PROFILE_VELOCITY[motor_id])
+                except Exception as exc:
+                    self.get_logger().error('restore profile ID%d failed: %s' % (motor_id, exc))
+
+    def _test_can_move(self, require_reference=True):
+        if self.busy or self._pause_event.is_set() or self._tool_change_waiting:
+            self.get_logger().warning('Test command unavailable while busy or paused')
+            return False
+        if self.phase == 'ERROR_HOLDING':
+            self.get_logger().error('Hardware fault must be resolved before moving')
+            return False
+        if self.use_robot and ((require_reference and not self.reference_ready) or not self.b_ready or
+                               self.bridge is None or self.b_arm is None or
+                               self.rail is None):
+            self.get_logger().error('A/B arms or suction controller unavailable')
+            return False
+        return True
+
+    def _test_help(self):
+        self.get_logger().info(
+            'BASEPLATE TEST: baseplate = pick + 17 views + hold; '
+            'inspect = 17 views without pick; bottom|back|flash [q5_deg] '
+            '= pose only; inspect bottom|back|flash [q5_deg] = one observation; '
+            'aj q1 q2 q3 q4 q5; bj q1 q2 q3 q4 q5 q6; '
+            'views; status; suction on|off; mechhome; stop; resume; abort')
+
+    def _handle_test_command(self, parts):
+        if not parts:
+            return True
+        name = parts[0]
+        if name in ('help', 'h', '?'):
+            self._test_help()
+            return True
+        if name == 'views':
+            for view, (a, b) in self._BASEPLATE_POSES.items():
+                self.get_logger().info('%s: A=%s deg, B=%s deg' % (view, a, b))
+            self.get_logger().info('BACK/FLASH scan q5=%s deg' % (self._BASEPLATE_YAWS,))
+            return True
+        if name == 'status':
+            self._log_status()
+            self.get_logger().info('Test holding=%s; last result=%s; observations=%s'
+                                   % (self._test_holding, self._test_result,
+                                      self._test_records))
+            return True
+        if name == 'baseplate' or (name == 'inspect' and len(parts) == 1):
+            if len(parts) != 1:
+                self.get_logger().error('usage: baseplate')
+            else:
+                self._start_baseplate_test(pick=(name == 'baseplate'))
+            return True
+        if name == 'mechhome':
+            if len(parts) != 1:
+                self.get_logger().error('usage: mechhome')
+            elif self._test_holding or (self.rail is not None and self.rail.suction_on):
+                self.get_logger().error('mechhome blocked while suction/part hold is active')
+            elif self._test_can_move(require_reference=False):
+                rail_mm = self.rail.position_mm if self.rail is not None else self.sim_rail_mm
+                if abs(rail_mm) > self.rail_tol_mm:
+                    self.get_logger().error('mechhome requires rail at 0 mm')
+                    return True
+                self._test_last_view = None
+                self._start_auxiliary('MECH_REFERENCE_TO_STRAIGHT_HOME',
+                                      self._measured_mechhome)
+            return True
+        if name in ('inspect', 'bottom', 'back', 'flash'):
+            pose_parts = parts[1:] if name == 'inspect' else parts
+            if not 1 <= len(pose_parts) <= 2:
+                self.get_logger().error('usage: bottom|back|flash [q5_deg] or inspect bottom|back|flash [q5_deg]')
+                return True
+            view = pose_parts[0].upper()
+            try:
+                q5 = float(pose_parts[1]) if len(pose_parts) == 2 else 0.0
+                if view not in self._BASEPLATE_POSES or not math.isfinite(q5):
+                    raise ValueError()
+                if not -180 <= q5 <= 180:
+                    raise ValueError()
+            except ValueError:
+                self.get_logger().error('pose needs bottom/back/flash and q5 in [-180, 180]')
+                return True
+            if self._test_can_move():
+                self.target = dict(product='baseplate', judge='OK', point=None)
+                self.cycle_id = uuid.uuid4().hex[:12]
+                self._start_auxiliary(
+                    view + '_VIEW',
+                    lambda: self._run_single_baseplate_view(view, q5, name == 'inspect'))
+            return True
+        if name in ('on', 'off'):
+            if len(parts) != 1:
+                self.get_logger().error('usage: on | off')
+            elif self._test_can_move():
+                self._start_auxiliary(
+                    'SUCTION_' + name.upper(),
+                    lambda: self._test_suction(name == 'on'))
+            return True
+        if name in ('aj', 'bj', 'bhome', 'b_home', 'stop', 's', 'estop', '0',
+                    'resume', 'abort', 'abort_cycle'):
+            if name in ('aj', 'bj', 'bhome', 'b_home'):
+                if not self._test_can_move():
+                    return True
+                self._test_last_view = None
+            return False
+        self.get_logger().warning('Command unavailable in baseplate test mode: %s' % name)
+        self._test_help()
+        return True
+
+    def _test_suction(self, on):
+        # Conservatively mark a possible held part before an ON operation.
+        if on:
+            self._test_holding = True
+        self._suction(on)
+        self._test_holding = bool(on)
+
+    def _start_baseplate_test(self, pick):
+        if not self._test_can_move():
+            return
+        if pick and not self.top_camera_enabled:
+            self.get_logger().warning('baseplate pick needs TOP camera coordinates. '
+                                      'With TOP disabled, manually hold the part and use inspect; '
+                                      'aj/bj/bottom/back/flash remain available.')
+            return
+        if self.tool != 'suction':
+            self.get_logger().error('Baseplate test requires the suction tool')
+            return
+        if pick and self._test_holding:
+            self.get_logger().warning('A part may already be held. Use inspect to test it; '
+                                      'place it down before suction off and another pick.')
+            return
+        if not pick:
+            self._test_holding = True  # The operator supplies an already held part.
+        self.target = dict(self._test_top or
+                           dict(product='baseplate', judge='OK', point=None))
+        # A cached TOP verdict belongs to one pick only.
+        self._test_top = None
+        self.cycle_id = uuid.uuid4().hex[:12]
+        self._test_records = []
+        self._test_result = None
+        self._holes_needed_after = None
+        self._start_auxiliary('BASEPLATE_TEST', lambda: self._run_baseplate_test(pick))
+
+    def _move_baseplate_view(self, view, q5=0.0):
+        a, b = self._BASEPLATE_POSES[view]
+        a = list(a[:4]) + [float(q5)]
+        previous_view = self._test_last_view
+        self._test_last_view = None
+        # Preserve the existing B q1=75 deg transition, using the actual last
+        # commanded B pose so reverse/manual view selection does not assume BOTTOM.
+        if previous_view != view and self._last_b_pose is not None:
+            intermediate = list(self._last_b_pose)
+            intermediate[0] = 75.0
+            self._set_phase('BASEPLATE_TO_' + view + '_INTERMEDIATE')
+            self._dual_pose(a, intermediate)
+            self._set_phase(view + '_VIEW')
+            self._b_move(b)
+        else:
+            self._set_phase(view + '_VIEW')
+            self._dual_pose(a, b)
+        self._test_last_view = view
+
+    def _record_baseplate_inspection(self, label, q5):
+        judge = self._inspect(label)
+        self._test_records.append(dict(view=label, q5_deg=float(q5), judge=judge))
+        self.get_logger().info('BASEPLATE %s q5=%.1f deg: %s' % (label, q5, judge))
+        return judge
+
+    def _publish_baseplate_test_result(self):
+        if any(r['judge'] == 'NG' for r in self._test_records):
+            self._test_result = 'NG'
+        elif self._test_records and all(r['judge'] == 'OK' for r in self._test_records):
+            self._test_result = 'OK'
+        else:
+            self._test_result = 'NOT_INSPECTED'
+        mode = ('SIMULATED' if self.simulate_inspection and not self.use_robot
+                else 'CAMERA' if self.arm_camera_enabled else 'MOTION_ONLY')
+        self.test_result_pub.publish(String(data=json.dumps(dict(
+            product='baseplate', cycle_id=self.cycle_id, judge=self._test_result,
+            inspection_mode=mode,
+            observations=self._test_records))))
+
+    def _finish_baseplate_test(self):
+        self._set_phase('VIEW_MOTION_DONE_HOLDING' if self._test_result == 'NOT_INSPECTED'
+                        else 'INSPECTION_DONE_HOLDING')
+
+    def _run_single_baseplate_view(self, view, q5, observe):
+        try:
+            self._move_baseplate_view(view, q5)
+            if observe:
+                self._test_holding = True
+                self._test_records = []
+                self._test_result = None
+                self._record_baseplate_inspection(view + '_1', q5)
+                self._publish_baseplate_test_result()
+                self._finish_baseplate_test()
+            else:
+                self._set_phase('BASEPLATE_' + view + '_POSE_READY')
+        finally:
+            if observe:
+                self.side_pub.publish(String(data=json.dumps(dict(command='STOP'))))
+            self.target = None
+
+    def _run_baseplate_test(self, pick):
+        try:
+            if pick:
+                self._set_phase('BASEPLATE_WAIT_PICK_MID')
+                self.latest_holes = None
+                self._holes_needed_after = time.monotonic()
+                self.hole_pub.publish(String(data='START'))
+                self._wait_holes()
+                point = np.asarray(self.latest_holes[:2], dtype=float).copy()
+                self.hole_pub.publish(String(data='STOP'))
+                self._holes_needed_after = None
+                self._set_phase('TOP_PICK_BASEPLATE')
+                self._vertical_at(point, self.base_z, lambda: self._test_suction(True))
+                if self.target['judge'] == 'NG':
+                    self.get_logger().warning('TOP verdict NG; test continues through all views')
+            self._move_baseplate_view('BOTTOM')
+            self._record_baseplate_inspection('BOTTOM_1', 0)
+            for view in ('BACK', 'FLASH'):
+                self._move_baseplate_view(view)
+                for index, q5 in enumerate(self._BASEPLATE_YAWS, 1):
+                    self._set_phase(view + '_VIEW')
+                    a, _ = self._BASEPLATE_POSES[view]
+                    self._move_arm(list(a[:4]) + [q5])
+                    self._record_baseplate_inspection('%s_%d' % (view, index), q5)
+            self._publish_baseplate_test_result()
+            self._finish_baseplate_test()
+            self.get_logger().info(
+                '17-view test complete: %s. Both arms hold their last poses; '
+                'suction stays on. Use aj/bj/bottom/back/flash/inspect for further tests.'
+                % self._test_result)
+        finally:
+            self.hole_pub.publish(String(data='STOP'))
+            self.side_pub.publish(String(data=json.dumps(dict(command='STOP'))))
+            self._waiting_request = None
+            self._holes_needed_after = None
+            self.target = None
+
+    def _start_auxiliary(self, phase, callback):
+        if not getattr(self, 'baseplate_test_mode', False):
+            return super()._start_auxiliary(phase, callback)
+        with self._state_lock:
+            if self.busy:
+                self.get_logger().warning('Test is busy')
+                return
+            self.busy = True
+            self._stop_event.clear()
+            self._paused_seconds = 0.0
+            self._pause_started = None
+        def worker():
+            try:
+                self._set_phase(phase)
+                callback()
+                # The inherited worker overwrites successful phases with READY.
+                # Keep the inspection result visible while allowing manual commands.
+                if self.phase not in ('INSPECTION_DONE_HOLDING', 'VIEW_MOTION_DONE_HOLDING') and not (
+                        self.phase.startswith('BASEPLATE_') and
+                        self.phase.endswith('_POSE_READY')):
+                    self._set_phase('READY')
+            except SequenceStopped:
+                self._set_phase('STOPPED_READY')
+            except Exception as exc:
+                self._fail(str(exc))
+            finally:
+                with self._state_lock:
+                    self.busy = False
+                self._publish_state()
+                self._send_viewer_state(force=True)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _emergency_stop(self, reason):
+        super()._emergency_stop(reason)
+        # The inherited stop holds A/rail/gripper; test faults also hold B.
+        if getattr(self, 'baseplate_test_mode', False):
+            arm = getattr(self, 'b_arm', None)
+            if arm is not None:
+                try:
+                    present = arm.read_present_ticks(retry=1, use_fallback=False)
+                    arm.write_goal_ticks(present)
+                except Exception as exc:
+                    self.get_logger().error('B-arm emergency hold failed: %s' % exc)
+
 
     def _close_hardware(self):
         if self.rail is not None and self.rail.connected:

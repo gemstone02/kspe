@@ -19,12 +19,60 @@ from .cell import Cell
 from .centric_sequence_5axis import JOINT_MOTORS, PROFILE_VELOCITY
 from .centric_gripper_5axis import CentricGripper
 from .cell_rail_serial import RAIL_MAX_M
+from .kinematics_ee_5axis import fk_pos
 
 
 ITEMS = ('shaft1', 'shaft2', 'bearing1', 'bearing2', 'gear1', 'gear2')
-MECHANICAL_REFERENCE_DEG = (0.0, 56.7312, -134.3335, 108.6579, 0.0)
-SHAFT_PICK_DEG = (0.0, -16.0, -129.0, -34.0, 0.0)
-BEARING_PICK_DEG = (0.0, -47.0, -61.0, -68.0, 0.0)
+ASSEMBLY_RAIL_TRAVEL_POSE_DEG = (0.0, 30.0, -40.0, -90.0, 0.0)
+ASSEMBLY_INSERT_Z_MM = {'shaft1': 0.0, 'shaft2': 0.0,
+                        'bearing1': 0.0, 'bearing2': 0.0,
+                        'gear1': -3.0, 'gear2': -3.0}
+INSERT_RELEASE_DWELL_SEC = 0.3
+# Manual insertion trials may request a small negative Z, but all of the
+# inherited IK and floor-collision checks still have to approve the path.
+MIN_MANUAL_INSERT_Z_MM = -5.0
+DEFAULT_MOTOR_TRACE_DIR = '/media/wonseok/새 볼륨/project/a_motors_log'
+DEFAULT_MOTOR_TRACE_MOUNT = '/media/wonseok/새 볼륨'
+# Measured change in motor ticks from the physical limit to the desired
+# straight pose. At mechhome we read the *current* ticks at the limit and add
+# these offsets; the absolute encoder readings are not stored as home values.
+# ID3/ID4 and ID5/ID6 drive shared links in opposite directions. A measured
+# 51-tick discrepancy between ID3/ID4 would make their targets disagree on
+# the link angle, so derive each second motor's travel from the first motor.
+# ID6's independently recorded straight reading was unreliable as well.
+MECHANICAL_HOME_OFFSETS = {
+    2: 3473.5 - (-4279.0),
+    3: 1562.0 - 8414.5,
+    5: 995.8 - (-3140.0),
+}
+# Relative to the original measured stop-to-straight offset above, the ID2
+# home goal must travel 4 degrees farther in the negative q2 direction.
+# This adds about 682.7 motor ticks total (341.3 beyond the previous -2 deg
+# correction). After mechhome the corrected straight pose is reported as q2=0.
+MECH_Q2_STRAIGHT_CORRECTION_DEG = -4.0
+MECHANICAL_HOME_OFFSETS[2] += (
+    JOINT_MOTORS[1]['dir'] * JOINT_MOTORS[1]['pair_sign'][0]
+    * MECH_Q2_STRAIGHT_CORRECTION_DEG
+    * JOINT_MOTORS[1]['gear'] * 4096.0 / 360.0
+)
+MEASURED_ID4_OFFSET = 1833.5 - (-4968.0)  # 51 ticks short of opposite ID3
+MECHANICAL_HOME_OFFSETS[4] = -MECHANICAL_HOME_OFFSETS[3]
+MECHANICAL_HOME_OFFSETS[6] = -MECHANICAL_HOME_OFFSETS[5]
+# These joint angles describe the measured limit posture for the simulator,
+# progress reporting and the homing timeout. ID3 supplies the q3 angle.
+MECHANICAL_REFERENCE_DEG = (
+    0.0,
+    MECHANICAL_HOME_OFFSETS[2] / (4096 * JOINT_MOTORS[1]['gear']) * 360.0,
+    MECHANICAL_HOME_OFFSETS[3] / (4096 * JOINT_MOTORS[2]['gear']) * 360.0,
+    MECHANICAL_HOME_OFFSETS[5] / (4096 * JOINT_MOTORS[3]['gear']) * 360.0,
+    0.0,
+)
+SHAFT_PICK_DEG = (0.0, -18.0, -129.0, -36.0, 50.0)
+BEARING_PICK_DEG = (0.0, -53.0, -59.0, -69.0, 0.0)
+
+
+class InsertionPlanRejected(RuntimeError):
+    """A proposed insertion path was rejected before its A-arm motion began."""
 
 
 class AssemblyDebug(Cell):
@@ -48,12 +96,19 @@ class AssemblyDebug(Cell):
         super().__init__()
         if not self.assembly_debug_mode or self.use_b_robot:
             raise RuntimeError('assembly_debug requires assembly_debug_mode:=true and B disabled')
-        self.declare_parameter('insert_release_q4_deg', 5.0)
-        self.insert_release_q4_deg = float(
-            self.get_parameter('insert_release_q4_deg').value)
-        if not math.isfinite(self.insert_release_q4_deg) or \
-                not -15.0 <= self.insert_release_q4_deg <= 15.0:
-            raise ValueError('insert_release_q4_deg must be within -15..15 degrees')
+        # Assembly-only rail pose. The full cell and its own travel pose are unchanged.
+        self.rail_travel_pose_deg = list(ASSEMBLY_RAIL_TRAVEL_POSE_DEG)
+        self.declare_parameter('insert_approach_clearance_mm', 25.0)
+        self.declare_parameter('insert_q5_rotation_deg', 15.0)
+        self.insert_approach_clearance_mm = float(
+            self.get_parameter('insert_approach_clearance_mm').value)
+        self.insert_q5_rotation_deg = float(
+            self.get_parameter('insert_q5_rotation_deg').value)
+        if not math.isfinite(self.insert_approach_clearance_mm) or \
+                self.insert_approach_clearance_mm <= 0:
+            raise ValueError('insert_approach_clearance_mm must be positive and finite')
+        if not math.isfinite(self.insert_q5_rotation_deg):
+            raise ValueError('insert_q5_rotation_deg must be finite')
         if self.assembly_reference_mode == 'current':
             self.get_logger().info('A-arm startup pose recorded as straight [0,0,0,0,0]')
         self.pick_overrides = {}
@@ -66,10 +121,20 @@ class AssemblyDebug(Cell):
         self.manual_grasp_ready = False
         self.vision_scan_started = None
         self.insert_retreat_path = None
+        self._cycle_index = None             # Next of the six parts to complete.
+        self._cycle_holes = None             # Vision coordinates frozen at start.
+        self._cycle_released_item = None     # Release succeeded, retreat may remain.
+        self._cycle_running = False
+        self._cycle_uncertain = False        # Interrupted during grasp/release.
+        self._cycle_needs_clearance = False # Aborted inside vertical motion.
+        self._pending_manual_command = None
+        self._manual_after_stop_timer = self.create_timer(
+            0.05, self._dispatch_manual_after_stop)
         self.product_pub = self.create_publisher(String, '/cell/product', 10)
         self.declare_parameter('motor_trace', True)
         self.declare_parameter('motor_trace_period_sec', 0.5)
-        self.declare_parameter('motor_trace_ids', '2,3,5')
+        self.declare_parameter('motor_trace_ids', '1,2,3,4,5,6,7')
+        self.declare_parameter('motor_trace_dir', DEFAULT_MOTOR_TRACE_DIR)
         self._trace_stop = threading.Event()
         self._trace_thread = None
         self._trace_file = None
@@ -146,12 +211,32 @@ class AssemblyDebug(Cell):
         period = float(self.get_parameter('motor_trace_period_sec').value)
         if not math.isfinite(period) or period < 0.5:
             raise ValueError('motor_trace_period_sec must be >= 0.5')
-        directory = os.path.expanduser('~/.ros/log')
-        os.makedirs(directory, exist_ok=True)
+        directory = os.path.abspath(os.path.expanduser(
+            str(self.get_parameter('motor_trace_dir').value)))
+        # Do not create the mount directory on the system drive if the SSD is
+        # disconnected. No silent fallback to ~/.ros/log.
+        if os.path.commonpath((directory, DEFAULT_MOTOR_TRACE_MOUNT)) == \
+                DEFAULT_MOTOR_TRACE_MOUNT and not os.path.ismount(DEFAULT_MOTOR_TRACE_MOUNT):
+            self.get_logger().error(
+                'Motor trace disabled: SSD is not mounted at %s'
+                % DEFAULT_MOTOR_TRACE_MOUNT)
+            return
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError as exc:
+            self.get_logger().error('Motor trace disabled: cannot create %s: %s'
+                                    % (directory, exc))
+            return
         stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         self.motor_trace_path = os.path.join(
             directory, 'assembly_motor_%s_%d.csv' % (stamp, os.getpid()))
-        self._trace_file = open(self.motor_trace_path, 'w', newline='', buffering=1)
+        try:
+            self._trace_file = open(self.motor_trace_path, 'w', newline='', buffering=1)
+        except OSError as exc:
+            self.get_logger().error('Motor trace disabled: cannot open %s: %s'
+                                    % (self.motor_trace_path, exc))
+            self.motor_trace_path = None
+            return
         fieldnames = ('timestamp', 'monotonic_sec', 'phase', 'motor_id',
                       'voltage_v', 'load_percent', 'pwm_percent', 'velocity_raw',
                       'position_tick', 'temperature_c', 'torque_enable',
@@ -207,7 +292,125 @@ class AssemblyDebug(Cell):
         super().destroy_node()
 
     def _start_sequence(self):
-        self.get_logger().warning('Full inspection process disabled here; use part shaft1 etc.')
+        self._start_assembly_cycle()
+
+    def _start_assembly_cycle(self):
+        if not self._ready('start', centric=True):
+            return
+        if self._pending_manual_command is not None:
+            self.get_logger().warning('Wait for the queued manual movement to complete')
+            return
+        if self._cycle_uncertain:
+            self.get_logger().error('Cycle state uncertain after stop during grasp/release. '
+                                    'Inspect the part and tool; empty the gripper, then '
+                                    'use cycle reset and scan before starting again.')
+            return
+        if self._cycle_index == len(ITEMS):
+            self.get_logger().error('Cycle completed before stop; inspect the parts, '
+                                    'then use cycle reset for a new cycle')
+            return
+        try:
+            holes = {kind: self._fresh_vision_hole(kind) for kind in ('mid', 'side')}
+        except RuntimeError as exc:
+            self.get_logger().error('start requires scan and fresh mid/side: %s' % exc)
+            return
+        if self._cycle_index is None:
+            if self.held_item is not None or self.insert_retreat_path is not None:
+                self.get_logger().error('start requires empty gripper and no pending retreat')
+                return
+            self._cycle_holes = holes
+            self._cycle_index = 0
+        elif any(np.linalg.norm(holes[kind] - self._cycle_holes[kind]) > 5.0
+                 for kind in ('mid', 'side')):
+            self.get_logger().error('Vision holes moved >5 mm since cycle start; '
+                                    'inspect assembly and use cycle reset if needed')
+            return
+        if self.held_item not in (None, ITEMS[self._cycle_index]):
+            self.get_logger().error('held item does not match cycle checkpoint')
+            return
+        if self.use_robot:
+            try:
+                actual_q = np.degrees(self._current_q_rad())
+                if not self.rail.query():
+                    raise RuntimeError('rail status query could not be sent')
+            except Exception as exc:
+                self.get_logger().error('start blocked: A-arm/rail state unreadable: %s' % exc)
+                return
+        else:
+            actual_q = np.degrees(self._current_q_rad())
+        if self._cycle_needs_clearance:
+            travel = np.asarray(self.rail_travel_pose_deg, dtype=float)
+            error = np.abs((actual_q[:5] - travel + 180.0) % 360.0 - 180.0)
+            rail_mm = self.rail.position_mm if self.rail is not None else self.sim_rail_mm
+            if np.max(error) > 5.0 or abs(rail_mm) > self.rail_tol_mm:
+                self.get_logger().error('start blocked after interrupted insertion: '
+                                        'inspect the tool, then manually move A to '
+                                        '%s and rail to 0 mm before restarting'
+                                        % list(ASSEMBLY_RAIL_TRAVEL_POSE_DEG))
+                return
+            # A manual correction made the old retreat trajectory obsolete.
+            self.insert_retreat_path = None
+            self._cycle_needs_clearance = False
+        if self.held_item is not None:
+            self.get_logger().warning('Resuming placement while holding %s; confirm the '
+                                      'part is still secured in the gripper' % self.held_item)
+        self._trial('ASSEMBLY_SIX_PARTS', self._run_assembly_cycle)
+
+    def _run_assembly_cycle(self):
+        self._cycle_running = True
+        try:
+            while self._cycle_index < len(ITEMS):
+                self._check_stop()
+                item = ITEMS[self._cycle_index]
+                self.get_logger().info('Assembly checkpoint %d/%d: %s'
+                                       % (self._cycle_index + 1, len(ITEMS), item))
+                if self._cycle_released_item == item:
+                    if self.insert_retreat_path is not None:
+                        self._retreat_after_insert()
+                    self._cycle_released_item = None
+                    self._cycle_index += 1
+                    continue
+                if self.held_item is None:
+                    self._pickup(item)
+                elif self.held_item != item:
+                    raise RuntimeError('unexpected held item %s at %s checkpoint'
+                                       % (self.held_item, item))
+                self._place(item, vision_point=self._cycle_holes[
+                    self._item_settings(item)[3]])
+                self._cycle_released_item = None
+                self._cycle_index += 1
+            self.get_logger().info('Assembly six-part cycle complete')
+            self._cycle_index = None
+            self._cycle_holes = None
+        finally:
+            self._cycle_running = False
+
+    def _abort_cycle(self):
+        if self._pause_event.is_set() and self._cycle_index is not None:
+            phase = str(getattr(self, '_paused_phase', '') or '')
+            if getattr(self, '_pause_needs_recovery', False):
+                self._cycle_uncertain = True
+            if '_VERTICAL_' in phase or '_RELEASE' in phase:
+                self._cycle_needs_clearance = True
+        super()._abort_cycle()
+        if self._cycle_index is not None:
+            if self._cycle_uncertain:
+                self.get_logger().warning('Stopped during part contact at %s; '
+                                          'automatic start is blocked until the part '
+                                          'and gripper are reconciled'
+                                          % ITEMS[self._cycle_index])
+            else:
+                self.get_logger().warning('Automatic cycle held at %s; start can '
+                                          'resume from this part checkpoint'
+                                          % ITEMS[self._cycle_index])
+
+    def _dispatch_manual_after_stop(self):
+        raw = self._pending_manual_command
+        if raw is None or self.busy or self._pause_event.is_set():
+            return
+        self._pending_manual_command = None
+        self.get_logger().warning('Stopped cycle cleared; executing requested manual command')
+        self._handle_command(raw)
 
     def _on_top(self, _msg):
         # An unrelated top detector must never start the full process.
@@ -241,7 +444,7 @@ class AssemblyDebug(Cell):
         self.get_logger().warning('CURRENT POSE stored as straight A=[0,0,0,0,0]; no motion')
 
     def _mechhome(self):
-        """Use the marked hard-stop posture to compute zero, then move home."""
+        """Apply measured stop-to-straight travel to live ticks, then move home."""
         if self.bridge is None:
             self.reference_ready = True
             self._set_sim_state(q_deg=list(MECHANICAL_REFERENCE_DEG))
@@ -250,14 +453,16 @@ class AssemblyDebug(Cell):
         # The code cannot sense a hard stop. The operator must physically
         # place J2/J3/J4 there and align the unbounded J1/J5 to their marks.
         self.reference_ready = False
-        new_zero = {}
-        for i, joint in enumerate(JOINT_MOTORS[:5]):
-            delta = self.bridge._r2t(math.radians(MECHANICAL_REFERENCE_DEG[i]),
-                                     joint['gear'])
-            for motor_index, motor_id in enumerate(joint['ids']):
-                present = int(self.bridge._present(motor_id))
-                sign = joint['dir'] * joint['pair_sign'][motor_index]
-                new_zero[motor_id] = int(round(present - sign * delta))
+        present_ticks = {motor_id: self.bridge._present(motor_id)
+                         for joint in JOINT_MOTORS[:5] for motor_id in joint['ids']}
+        new_zero = {motor_id: present + MECHANICAL_HOME_OFFSETS.get(motor_id, 0.0)
+                    for motor_id, present in present_ticks.items()}
+        self.get_logger().warning(
+            'MECH HOME measured limits=%s; straight goals=%s; '
+            'ID4 offset derived from ID3 (recorded ID4 differs by %.1f ticks); '
+            'ID6 offset derived from ID5' %
+            (present_ticks, {i: round(v) for i, v in new_zero.items()},
+             MECHANICAL_HOME_OFFSETS[4] - MEASURED_ID4_OFFSET))
         self.bridge.zero_tick.update(new_zero)
         measured = np.degrees(self.bridge.read_joints()[:5])
         if len(measured) != 5 or max(abs(measured - MECHANICAL_REFERENCE_DEG)) > 0.25:
@@ -286,8 +491,19 @@ class AssemblyDebug(Cell):
                 self._set_sim_state(q_deg=np.degrees(actual).tolist())
                 if max(abs(np.degrees(np.arctan2(np.sin(actual),
                                                 np.cos(actual))))) <= 1.5:
-                    self.get_logger().info('MECH HOME complete: A straight')
-                    return
+                    # read_joints uses only the first motor of each pair;
+                    # check ID4 and ID6 too before reporting completion.
+                    paired_ok = True
+                    for joint in JOINT_MOTORS[2:4]:
+                        motor_id = joint['ids'][1]
+                        tolerance_ticks = 1.5 * joint['gear'] * 4096 / 360.0
+                        actual_tick = self.bridge._present(motor_id)
+                        if abs(actual_tick - round(new_zero[motor_id])) > tolerance_ticks:
+                            paired_ok = False
+                    if paired_ok:
+                        self.get_logger().info('MECH HOME complete: A straight; '
+                                               'ID4/ID6 verified')
+                        return
                 time.sleep(0.15)
             raise RuntimeError('MECH HOME position timeout; holding current pose')
         finally:
@@ -301,17 +517,17 @@ class AssemblyDebug(Cell):
     def _item_settings(self, name):
         lookup = {
             'shaft1': (629.0, SHAFT_PICK_DEG,
-                       self.centric_preclose_angle_deg, 'mid', self.shaft_place_z_mm),
+                       self.centric_preclose_angle_deg, 'side', ASSEMBLY_INSERT_Z_MM['shaft1']),
             'shaft2': (690.0, SHAFT_PICK_DEG,
-                       self.centric_preclose_angle_deg, 'side', self.shaft_place_z_mm),
+                       self.centric_preclose_angle_deg, 'mid', ASSEMBLY_INSERT_Z_MM['shaft2']),
             'bearing1': (629.0, BEARING_PICK_DEG,
-                         self.bearing_preclose_angle_deg, 'mid', self.bearing_place_z_mm),
+                         self.bearing_preclose_angle_deg, 'side', ASSEMBLY_INSERT_Z_MM['bearing1']),
             'bearing2': (690.0, BEARING_PICK_DEG,
-                         self.bearing_preclose_angle_deg, 'side', self.bearing_place_z_mm),
+                         self.bearing_preclose_angle_deg, 'mid', ASSEMBLY_INSERT_Z_MM['bearing2']),
             'gear1': (802.0, SHAFT_PICK_DEG,
-                      50.0, 'mid', self.gear_place_z_mm),
+                      100.0, 'side', ASSEMBLY_INSERT_Z_MM['gear1']),
             'gear2': (889.0, SHAFT_PICK_DEG,
-                      50.0, 'side', self.gear_place_z_mm),
+                      50.0, 'mid', ASSEMBLY_INSERT_Z_MM['gear2']),
         }
         rail, pose, preclose, hole, z = lookup[name]
         rail, pose = self.pick_overrides.get(name, (rail, pose))
@@ -334,20 +550,31 @@ class AssemblyDebug(Cell):
             # A's straight-pose zero.  Never restart an automatic sequence on
             # the strength of a successful unrelated manual command.
             manual = ('aj', 'r', 'grip', 'grasp', 'open', 'motors',
-                      'tool', 'suction', 'retreat')
+                      'tool', 'suction', 'retreat', 'scan')
             if action not in manual:
                 self.get_logger().error(
-                    '%s blocked after fault; manual aj/r/grip/tool/suction/motors '
-                    'remain available. Last fault: %s'
+                    '%s blocked after fault; scan and manual '
+                    'aj/r/grip/tool/suction/motors remain available. Last fault: %s'
                     % (action, self._last_debug_fault))
                 return False
-            self.get_logger().warning(
-                '%s manual retry after fault: %s. Inspect clearance, tool and '
-                'motor LEDs; hardware protection remains active.'
-                % (action, self._last_debug_fault))
-        if self.use_robot and (self.bridge is None or not self.reference_ready or self.rail is None):
-            self.get_logger().error('%s blocked: A arm or rail unavailable' % action)
-            return False
+            if action == 'scan':
+                self.get_logger().warning(
+                    'scan after fault: refresh vision coordinates only; '
+                    'automatic insertion remains blocked until the cause is corrected')
+            else:
+                self.get_logger().warning(
+                    '%s manual retry after fault: %s. Inspect clearance, tool and '
+                    'motor LEDs; hardware protection remains active.'
+                    % (action, self._last_debug_fault))
+        if action != 'scan' and self.use_robot:
+            if self.bridge is None or self.rail is None:
+                self.get_logger().error('%s blocked: A arm or rail unavailable' % action)
+                return False
+            if not self.reference_ready:
+                self.get_logger().error('%s blocked: A-arm reference not ready; '
+                                        'use mechhome at the mechanical limits '
+                                        'or herehome when already straight' % action)
+                return False
         if centric and (self.tool != 'centric' or (self.use_robot and self.gripper is None)):
             self.get_logger().error('%s requires tool centric after physically installing ID8' % action)
             return False
@@ -373,9 +600,17 @@ class AssemblyDebug(Cell):
         def worker():
             try:
                 action()
+            except InsertionPlanRejected as exc:
+                # The planner rejected this candidate before sending the
+                # insertion trajectory. Keep the grasp and stored coordinates;
+                # _start_auxiliary will return to READY and accept a new Z.
+                self.get_logger().warning(
+                    'Insertion path rejected: %s. Gripper remains closed; '
+                    'try mid/side again with a safer Z. No A-arm insertion '
+                    'trajectory was sent.' % exc)
             except Exception:
-                # The inherited worker marks ERROR_HOLDING; grip state is retained
-                # so the operator can see what was last commanded.
+                # Communication, hardware and movement faults still stop the
+                # cell; the actual arm/part state may have changed.
                 raise
         self._start_auxiliary(phase, worker)
 
@@ -417,21 +652,24 @@ class AssemblyDebug(Cell):
         self._lift_after_grasp()
         self.get_logger().info('%s lifted; use place %s or adjust and retry' % (item, item))
 
-    def _place(self, item):
+    def _place(self, item, z_override=None, vision_point=None):
         self._leave_insert_if_needed('place_' + item)
         _, _, _, hole, z = self._item_settings(item)
-        point = self._hole(hole)
+        if z_override is not None:
+            z = z_override
+        point = self._hole(hole) if vision_point is None else np.asarray(
+            vision_point, dtype=float).copy()
         self._set_phase(item.upper() + '_TRAVEL_TO_BASEPLATE')
         self._move_arm(self.rail_travel_pose_deg)
         self._move_rail(0)
-        self._insert_vision(point, hole, z)
+        self._insert_vision(point, hole, z, rotate_q5=(item == 'gear2'))
         self._retreat_after_insert()
         self.get_logger().info('%s placed at %s %s Z=%.1f mm'
                                % (item, hole, point.tolist(), z))
 
-    def _part(self, item):
+    def _part(self, item, z_override=None):
         self._pickup(item)
-        self._place(item)
+        self._place(item, z_override=z_override)
 
     def _fresh_vision_hole(self, kind):
         if self.vision_scan_started is None or self.latest_holes is None or \
@@ -445,7 +683,7 @@ class AssemblyDebug(Cell):
             raise RuntimeError('invalid %s vision hole coordinate' % kind)
         return point
 
-    def _insert_vision(self, point, hole, z):
+    def _insert_vision(self, point, hole, z, rotate_q5=False):
         # A dedicated diagnostic action. It stops immediately after opening
         # at the insertion depth; retreat is an explicit later command.
         self._leave_insert_if_needed('insert_' + hole)
@@ -459,39 +697,118 @@ class AssemblyDebug(Cell):
         if abs(present_rail) > self.rail_tol_mm:
             self._set_phase(hole.upper() + '_RAIL_HOME_BEFORE_INSERT')
             self._move_rail(0.0)
-        approach, descent, ascent, world_low = self._build_vertical_paths(
-            float(point[0]), float(point[1]), target_z_mm=float(z))
-        q4_offset = self.insert_release_q4_deg
-        corrected_descent = np.asarray(descent, dtype=float).copy()
-        corrected_descent[:, 3] += math.radians(q4_offset)
-        corrected_ascent = np.asarray(ascent, dtype=float).copy()
-        corrected_ascent[:, 3] += math.radians(q4_offset)
-        error = self._collision_error(corrected_descent[:, :4],
-                                      hole + ' corrected insertion descent')
+        # The inherited planner puts its high point at target_z_mm + approach_mm,
+        # regardless of the requested low Z. Scope its two settings so *this*
+        # insertion begins exactly clearance_mm above the requested final Z.
+        original_target_z, original_approach = self.target_z_mm, self.approach_mm
+        try:
+            self.target_z_mm = float(z)
+            self.approach_mm = self.insert_approach_clearance_mm
+            try:
+                approach, descent, ascent, world_low = self._build_vertical_paths(
+                    float(point[0]), float(point[1]), target_z_mm=float(z))
+            except RuntimeError as exc:
+                # The inherited planner checks the full descent before any
+                # insertion trajectory is sent. Its geometry/collision
+                # failures are safe to replan with another target Z. Read or
+                # transport failures must still take the normal fault path.
+                reason = str(exc)
+                if (' collision at sample ' in reason or
+                        reason.startswith(('no exact vertical IK at approach point',
+                                           'vertical descent failed:',
+                                           'vertical top approach failed:',
+                                           'vertical path planning failed',
+                                           'approach retiming failed:'))):
+                    raise InsertionPlanRejected(reason) from exc
+                raise
+        finally:
+            self.target_z_mm, self.approach_mm = original_target_z, original_approach
+        descent = np.asarray(descent, dtype=float)
+        ascent = np.asarray(ascent, dtype=float)
+        if descent.ndim != 2 or descent.shape[0] < 2 or descent.shape[1] != 5:
+            raise RuntimeError('insertion descent must have at least two five-joint samples')
+        # Pick the sample at the halfway *height*, rather than halfway in
+        # time: retiming makes those different. Stop at this vertical pose
+        # before starting any q5 turn.
+        if len(descent) < 3:
+            raise InsertionPlanRejected('insertion path has no interior midpoint')
+        mid_world = self.a3_to_world(
+            float(point[0]), float(point[1]),
+            float(z) + self.insert_approach_clearance_mm / 2.0)
+        mid_arm_z = float(self.world_to_arm(mid_world)[2])
+        heights = np.array([fk_pos(q[:4])[2] for q in descent])
+        mid_index = int(np.clip(np.argmin(np.abs(heights - mid_arm_z)),
+                                1, len(descent) - 2))
+        q5_start = float(descent[0, 4])
+        q5_end = q5_start
+        turn_time = (len(descent) - mid_index - 1) / self.planner_hz
+        if rotate_q5:
+            q5_limit_deg_s = (PROFILE_VELOCITY[7] * 0.229 * 6.0 /
+                              JOINT_MOTORS[4]['gear'] * self.speed_margin)
+            if not math.isfinite(q5_limit_deg_s) or q5_limit_deg_s <= 0:
+                raise InsertionPlanRejected(
+                    'invalid q5 wrist speed limit: %s deg/s' % q5_limit_deg_s)
+            # Rotate for the entire midpoint-to-target descent. The requested
+            # angle is a maximum, not a reason to stretch the vertical motion.
+            # At a typical 0.33 s descent, 45 deg/s gives about 15 degrees.
+            safe_turn_speed = min(45.0, q5_limit_deg_s * 0.75)
+            turn_deg = math.copysign(
+                min(abs(self.insert_q5_rotation_deg),
+                    safe_turn_speed * turn_time), self.insert_q5_rotation_deg)
+            q5_end = q5_start + math.radians(turn_deg)
+            descent[:mid_index + 1, 4] = q5_start
+            descent[mid_index:, 4] = q5_start + (q5_end - q5_start) * \
+                np.linspace(0.0, 1.0, len(descent) - mid_index)
+            ascent[:, 4] = q5_end
+            if abs(turn_deg) < abs(self.insert_q5_rotation_deg) - 1e-6:
+                self.get_logger().info(
+                    'q5 insertion turn %.2f deg (requested maximum %.2f deg) '
+                    'during %.2f s descent, safe speed %.1f deg/s; '
+                    'vertical descent timing unchanged'
+                    % (turn_deg, self.insert_q5_rotation_deg, turn_time,
+                       safe_turn_speed))
+        error = self._collision_error(descent[:, :4],
+                                      hole + ' insertion descent')
         if error:
-            raise RuntimeError(error)
-        error = self._collision_error(corrected_ascent[:, :4],
-                                      hole + ' corrected insertion retreat')
+            raise InsertionPlanRejected(error)
+        error = self._collision_error(ascent[:, :4],
+                                      hole + ' insertion retreat')
         if error:
-            raise RuntimeError(error)
+            raise InsertionPlanRejected(error)
         self._move_marker(hole, world_low)
+        self.get_logger().info('%s insertion: Z %.1f -> %.1f mm, q5 %.2f -> %.2f deg '
+                               'over %.2fs (%s); release after descent'
+                               % (hole, float(z) + self.insert_approach_clearance_mm,
+                                  float(z), math.degrees(q5_start),
+                                  math.degrees(q5_end), turn_time,
+                                  'rotating' if rotate_q5 else 'fixed'))
         self._set_phase(hole.upper() + '_VERTICAL_TOP_APPROACH')
         self._execute_joint_trajectory(approach)
-        # Adjust the wrist while still above the part. The entire descent
-        # then uses the corrected wrist angle; never pivot at insertion depth.
-        if q4_offset:
-            self._set_phase('%s_Q4_%+g_DEG_BEFORE_DESCENT' % (hole.upper(), q4_offset))
-            goal = np.asarray(corrected_descent[0], dtype=float)
-            self.get_logger().info(
-                '%s: q4 correction %+g deg applied at approach height; '
-                'holding it through descent and retreat' % (hole, q4_offset))
-            self._move_arm(np.degrees(goal).tolist())
+        self._set_phase(hole.upper() + '_VERTICAL_MIDPOINT')
+        self._execute_joint_trajectory(descent[:mid_index + 1])
+        actual_mid = np.degrees(self._current_q_rad())
+        actual_pitch_sum = float(sum(actual_mid[1:4]))
+        pitch_error = (actual_pitch_sum - 180.0 + 180.0) % 360.0 - 180.0
+        self.get_logger().info(
+            '%s midpoint: Z=%.1f mm, q2+q3+q4=%.2f deg '
+            '(model vertical error=%.2f deg); q5 turn starts on remaining descent'
+            % (hole, float(z) + self.insert_approach_clearance_mm / 2.0,
+               actual_pitch_sum, pitch_error))
+        self._check_stop()
         self._set_phase(hole.upper() + '_VERTICAL_DESCENT')
-        self._execute_joint_trajectory(corrected_descent)
-        self.insert_retreat_path = corrected_ascent
+        self._execute_joint_trajectory(descent[mid_index:])
+        self.insert_retreat_path = ascent
+        self._set_phase(hole.upper() + '_WAIT_BEFORE_RELEASE')
+        deadline = self._process_time() + INSERT_RELEASE_DWELL_SEC
+        while self._process_time() < deadline:
+            self._check_stop()  # Stop immediately; pause freezes the dwell clock.
+            time.sleep(min(0.01, max(0.001, deadline - self._process_time())))
+        self._check_stop()
         self._set_phase(hole.upper() + '_RELEASE')
         if not self._move_gripper_ratio(self.release_ratio):
             raise RuntimeError('%s centric release failed' % hole)
+        if self._cycle_running:
+            self._cycle_released_item = self.held_item
         self.held_item = None
         self.manual_grasp_ready = False
         self._assembly_cycle_active = False
@@ -579,29 +896,60 @@ class AssemblyDebug(Cell):
         cmd = parts[0]
         if cmd in ('stop', 's', 'estop', '0', 'resume', 'abort', 'abort_cycle'):
             return super()._handle_command(raw)
+        if cmd in ('aj', 'r') and self._pause_event.is_set():
+            if self._pending_manual_command is not None:
+                self.get_logger().warning('Another manual command is already queued')
+                return
+            # A manual move changes the measured pause pose. Cancel the
+            # interrupted trajectory; never resume that old sample afterward.
+            self._pending_manual_command = str(raw)
+            self._abort_cycle()
+            self.get_logger().warning('Manual %s queued after E-stop; '
+                                      'start later resumes from the current part checkpoint'
+                                      % cmd)
+            return
         if cmd in ('help', '?'):
             self.get_logger().info(
                 'mechhome (at mechanical stops) | herehome (already straight) | '
                 'aj q1 q2 q3 q4 q5 | r mm | hole mid|side X Y | '
                 'setpick item rail_mm q1 q2 q3 q4 q5 | setz item Z_mm | '
                 'tool centric|off|suction | grip 0..180|auto|open | '
-                'scan | mid Z_mm | side Z_mm | retreat | '
-                'shaft1|shaft2|bearing1|bearing2|gear1|gear2 | '
+                'scan | mid/side Z_mm (fixed q5) | mid/side rZ_mm (rotate q5) | retreat | '
+                'shaft1|shaft2|bearing1|bearing2|gear1|gear2 [Z_mm] | '
+                'start (six parts, scan first) | cycle reset | '
                 'assembly | part item | pickup item | place item | '
-                'lidpick | lidplace | suction on|off | stop | resume | status | motors '
+                'lidpick | lidplace | suction on|off | stop | resume | abort | status | motors '
                 '(manual commands remain available after a fault)')
             return
         if cmd == 'status':
             vision_ready = (self.vision_scan_started is not None and
                             self.latest_holes_stamp is not None and
                             self.latest_holes_stamp >= self.vision_scan_started)
+            checkpoint = (ITEMS[self._cycle_index] if self._cycle_index is not None
+                          and self._cycle_index < len(ITEMS) else None)
             self.get_logger().info('debug reference=%s ready=%s, held=%s, tool=%s, suction=%s, holes=%s, '
-                                   'vision_ready=%s, retreat_pending=%s, fault=%s, last_fault=%s'
+                                   'vision_ready=%s, retreat_pending=%s, checkpoint=%s, '
+                                   'cycle_uncertain=%s, fault=%s, last_fault=%s'
                                    % (self.assembly_reference_mode, self.reference_ready,
                                       self.held_item, self.tool, self.suction_enabled,
                                       {k: v.tolist() for k, v in self.hole_overrides.items()},
                                       vision_ready, self.insert_retreat_path is not None,
+                                      checkpoint, self._cycle_uncertain,
                                       self._debug_fault, self._last_debug_fault))
+            return
+        if cmd == 'cycle' and parts[1:] == ['reset']:
+            if self.busy or self._pause_event.is_set() or self.held_item is not None or \
+                    self.insert_retreat_path is not None:
+                self.get_logger().error('cycle reset requires idle arm, empty gripper, '
+                                        'and no pending insertion retreat')
+                return
+            self._cycle_index = None
+            self._cycle_holes = None
+            self._cycle_released_item = None
+            self._cycle_uncertain = False
+            self._cycle_needs_clearance = False
+            self.get_logger().warning('Cycle checkpoint cleared; remove any already '
+                                      'assembled parts before restarting at shaft1')
             return
         if cmd in ('mechhome', 'herehome'):
             if len(parts) != 1 or self.busy or self._pause_event.is_set() or \
@@ -618,7 +966,13 @@ class AssemblyDebug(Cell):
             self._trial('A_' + cmd.upper(), self._mechhome if cmd == 'mechhome'
                         else self._herehome)
             return
-        if cmd in ('bj', 'bhome', 'b_home', 'start', 'run', 'sample',
+        if cmd == 'start':
+            if len(parts) == 1:
+                self._start_assembly_cycle()
+            else:
+                self.get_logger().error('usage: start')
+            return
+        if cmd in ('bj', 'bhome', 'b_home', 'run', 'sample',
                    'rail', 'home', 'refhome', 'joint', 'j'):
             self.get_logger().error('%s disabled in assembly debug; use aj/r/part' % cmd)
             return
@@ -663,19 +1017,23 @@ class AssemblyDebug(Cell):
             return
         if cmd in ('mid', 'side'):
             if len(parts) != 2:
-                self.get_logger().error('usage: mid Z_mm | side Z_mm')
+                self.get_logger().error('usage: mid/side Z_mm | mid/side rZ_mm')
                 return
             if not self._ready(cmd, centric=True):
                 return
+            rotate_q5 = parts[1].startswith('r')
+            z_text = parts[1][1:] if rotate_q5 else parts[1]
             try:
-                z = float(parts[1])
+                z = float(z_text)
             except ValueError:
                 z = math.nan
-            # The inherited vertical planner starts at target_z + approach.
-            # Keep at least 5 mm of downward travel from that plane.
+            # The collision planner must approve every sample, including Z=0
+            # and small negative trials. Never bypass its floor check.
             max_z = self.target_z_mm + self.approach_mm - 5.0
-            if not math.isfinite(z) or not 0.0 < z <= max_z:
-                self.get_logger().error('target Z must be >0 and <= %.1f mm' % max_z)
+            if not math.isfinite(z) or not MIN_MANUAL_INSERT_Z_MM <= z <= max_z:
+                self.get_logger().error('target Z must be between %.1f and %.1f mm; '
+                                        'a planned floor collision still blocks motion'
+                                        % (MIN_MANUAL_INSERT_Z_MM, max_z))
                 return
             if self.held_item is None and not self.manual_grasp_ready:
                 self.get_logger().error('pickup an item or complete grip auto successfully first')
@@ -706,7 +1064,7 @@ class AssemblyDebug(Cell):
                         % (cmd, present_rail))
                     return
             self._trial('INSERT_' + cmd.upper(),
-                        lambda: self._insert_vision(point, cmd, z))
+                        lambda: self._insert_vision(point, cmd, z, rotate_q5=rotate_q5))
             return
         if cmd == 'insert':
             self.get_logger().error('insert ITEM was removed; use mid Z_mm or side Z_mm')
@@ -766,8 +1124,9 @@ class AssemblyDebug(Cell):
                 z = float(parts[2])
             except ValueError:
                 z = math.nan
-            if not math.isfinite(z) or not 0 < z <= self.target_z_mm:
-                self.get_logger().error('Z must be >0 and <= target_z_mm')
+            if not math.isfinite(z) or not MIN_MANUAL_INSERT_Z_MM <= z <= self.target_z_mm:
+                self.get_logger().error('Z must be between %.1f and %.1f mm'
+                                        % (MIN_MANUAL_INSERT_Z_MM, self.target_z_mm))
                 return
             self.place_z_overrides[parts[1]] = z
             self.get_logger().info('%s insertion Z=%.1f mm' % (parts[1], z))
@@ -847,21 +1206,25 @@ class AssemblyDebug(Cell):
             self._trial('SUCTION_' + parts[1].upper(), suction_action)
             return
         if cmd == 'assembly':
-            if len(parts) != 1 or not self._ready(cmd, centric=True) or self.held_item is not None:
-                self.get_logger().error('assembly requires idle empty centric tool')
-                return
-            try:
-                self._hole('mid')
-                self._hole('side')
-            except RuntimeError as exc:
-                self.get_logger().error(str(exc))
-                return
-            def run_six():
-                for item in ITEMS:
-                    self._part(item)
-            self._trial('ASSEMBLY_SIX_PARTS', run_six)
+            if len(parts) == 1:
+                self._start_assembly_cycle()
+            else:
+                self.get_logger().error('usage: assembly')
             return
-        if cmd in ITEMS and len(parts) == 1:
+        if cmd in ITEMS:
+            if len(parts) not in (1, 2):
+                self.get_logger().error('usage: %s [Z_mm]' % cmd)
+                return
+            z_override = None
+            if len(parts) == 2:
+                try:
+                    z_override = float(parts[1])
+                except ValueError:
+                    z_override = math.nan
+                if not math.isfinite(z_override) or not MIN_MANUAL_INSERT_Z_MM <= z_override <= self.target_z_mm:
+                    self.get_logger().error('%s Z must be between %.1f and %.1f mm'
+                                            % (cmd, MIN_MANUAL_INSERT_Z_MM, self.target_z_mm))
+                    return
             if not self._ready(cmd, centric=True, item=cmd) or self.held_item is not None:
                 self.get_logger().error('%s requires empty centric gripper' % cmd)
                 return
@@ -871,7 +1234,8 @@ class AssemblyDebug(Cell):
             except RuntimeError as exc:
                 self.get_logger().error(str(exc))
                 return
-            self._trial('PART_' + cmd.upper(), lambda item=cmd: self._part(item))
+            self._trial('PART_' + cmd.upper(),
+                        lambda item=cmd, z=z_override: self._part(item, z_override=z))
             return
         if cmd in ('part', 'pickup', 'place'):
             if len(parts) != 2 or parts[1] not in ITEMS:

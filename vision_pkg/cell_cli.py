@@ -13,7 +13,9 @@ def main():
     rclpy.init()
     node = rclpy.create_node('cell_cli')
     publisher = node.create_publisher(String, '/centric_sequence/command', 10)
-    print('CELL> aj 0 0 0 0 0 | bj 0 0 0 0 0 0 | r 500 | stop | quit')
+    print('CELL> help | baseplate | inspect | bottom/back/flash [q5] | mechhome | '
+          'aj q1 q2 q3 q4 q5 | bj q1 q2 q3 q4 q5 q6 | '
+          'suction on/off | status | stop | resume | abort | quit')
     try:
         while rclpy.ok():
             try:

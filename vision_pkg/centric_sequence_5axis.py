@@ -2029,7 +2029,7 @@ class _BaseplateCentricSequenceNode(CentricSequenceNode):
         d("limit_joint_speed", True)
         d("speed_margin", 0.90)
         d("check_collision", True)
-        d("arm_urdf_name", "robot_arm_5axis_suction.urdf")
+        d("arm_urdf_name", "robot_arm_5axis_centric.urdf")
 
         g = self.get_parameter
         self.auto_start_on_vision = bool(g("auto_start_on_vision").value)

@@ -101,7 +101,7 @@ class RobotCalibration:
     s_q5_m14: float = -1.0
     s_q5_m15: float = +1.0
 
-    s_q6_m16: float = +1.0
+    s_q6_m16: float = -1.0
 
     # Gear ratios: motor angle = joint angle * ratio
     r_q1: float = 40.0 / 14.0

@@ -23,10 +23,15 @@ def generate_launch_description():
         DeclareLaunchArgument('top_device', default_value='/dev/video0'),
         DeclareLaunchArgument('centric_grasp_limit_deg', default_value='180.0'),
         DeclareLaunchArgument('assembly_reference_mode', default_value='current'),
-        DeclareLaunchArgument('insert_release_q4_deg', default_value='5.0'),
+        DeclareLaunchArgument('insert_approach_clearance_mm', default_value='25.0'),
+        DeclareLaunchArgument('insert_q5_rotation_deg', default_value='15.0'),
+        DeclareLaunchArgument('joint_path_speed_deg_s', default_value='25.0'),
+        DeclareLaunchArgument('vertical_speed_mps', default_value='0.02'),
         DeclareLaunchArgument('motor_trace', default_value='true'),
         DeclareLaunchArgument('motor_trace_period_sec', default_value='0.5'),
-        DeclareLaunchArgument('motor_trace_ids', default_value='2,3,5'),
+        DeclareLaunchArgument('motor_trace_ids', default_value='1,2,3,4,5,6,7'),
+        DeclareLaunchArgument('motor_trace_dir',
+                              default_value='/media/wonseok/새 볼륨/project/a_motors_log'),
         Node(package='v4l2_camera', executable='v4l2_camera_node',
              name='top_camera', namespace='top_camera',
              condition=IfCondition(LaunchConfiguration('use_camera')),
@@ -52,13 +57,21 @@ def generate_launch_description():
                  'rail_auto_zero': True,
                  'require_reference_home': False,
                  'assembly_reference_mode': LaunchConfiguration('assembly_reference_mode'),
-                 'insert_release_q4_deg': ParameterValue(
-                     LaunchConfiguration('insert_release_q4_deg'), value_type=float),
+                 'insert_approach_clearance_mm': ParameterValue(
+                     LaunchConfiguration('insert_approach_clearance_mm'), value_type=float),
+                 'insert_q5_rotation_deg': ParameterValue(
+                     LaunchConfiguration('insert_q5_rotation_deg'), value_type=float),
+                 'joint_path_speed_deg_s': ParameterValue(
+                     LaunchConfiguration('joint_path_speed_deg_s'), value_type=float),
+                 'vertical_speed_mps': ParameterValue(
+                     LaunchConfiguration('vertical_speed_mps'), value_type=float),
                  'motor_trace': flag('motor_trace'),
                  'motor_trace_period_sec': ParameterValue(
                      LaunchConfiguration('motor_trace_period_sec'), value_type=float),
                  'motor_trace_ids': ParameterValue(
                      LaunchConfiguration('motor_trace_ids'), value_type=str),
+                 'motor_trace_dir': ParameterValue(
+                     LaunchConfiguration('motor_trace_dir'), value_type=str),
                  'centric_planet_max_angle_deg': ParameterValue(
                      LaunchConfiguration('centric_grasp_limit_deg'), value_type=float),
                  'centric_full_close_angle_deg': ParameterValue(
